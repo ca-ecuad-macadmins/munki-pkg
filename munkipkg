@@ -21,6 +21,8 @@ version control system like git.
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import absolute_import, print_function
+
 import glob
 import json
 import optparse
@@ -31,22 +33,26 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
+from xml.dom import minidom
+from xml.parsers.expat import ExpatError
 
 try:
     import yaml
-    yaml_installed = True
+    YAML_INSTALLED = True
 except ImportError:
-    yaml_installed = False
+    YAML_INSTALLED = False
 
 from xml.dom import minidom
 from xml.parsers.expat import ExpatError
 
-VERSION = "0.6"
+VERSION = "0.7"
 DITTO = "/usr/bin/ditto"
 LSBOM = "/usr/bin/lsbom"
 PKGBUILD = "/usr/bin/pkgbuild"
 PKGUTIL = "/usr/sbin/pkgutil"
 PRODUCTBUILD = "/usr/bin/productbuild"
+XCRUN = "/usr/bin/xcrun"
 
 GITIGNORE_DEFAULT = """# .DS_Store files!
 .DS_Store
@@ -58,6 +64,10 @@ build/
 BUILD_INFO_FILE = "build-info"
 REQUIREMENTS_PLIST = "product-requirements.plist"
 BOM_TEXT_FILE = "Bom.txt"
+
+STAPLE_TIMEOUT = 300
+STAPLE_SLEEP = 5
+
 
 class MunkiPkgError(Exception):
     '''Base Exception for errors in this domain'''
@@ -74,20 +84,49 @@ class PkgImportError(MunkiPkgError):
     pass
 
 
+def readPlistFromString(data):
+    '''Wrapper for the differences between Python 2 and Python 3's plistlib'''
+    try:
+        return plistlib.load(data)
+    except AttributeError:
+        # plistlib module doesn't have a load function (as in Python 2)
+        return plistlib.readPlistFromString(data)
+
+
+def readPlist(filepath):
+    '''Wrapper for the differences between Python 2 and Python 3's plistlib'''
+    try:
+        with open(filepath, "rb") as fileobj:
+            return plistlib.load(fileobj)
+    except AttributeError:
+        # plistlib module doesn't have a load function (as in Python 2)
+        return plistlib.readPlist(filepath)
+
+
+def writePlist(plist, filepath):
+    '''Wrapper for the differences between Python 2 and Python 3's plistlib'''
+    try:
+        with open(filepath, "wb") as fileobj:
+            plistlib.dump(plist, fileobj)
+    except AttributeError:
+        # plistlib module doesn't have a dump function (as in Python 2)
+        plistlib.writePlist(plist, filepath)
+
+
 def unlink_if_possible(pathname):
     '''Attempt to remove pathname but don't raise an execption if it fails'''
     try:
         os.unlink(pathname)
-    except OSError, err:
-        print >> sys.stderr, (
-            "WARNING: could not remove %s: %s" % (pathname, err))
+    except OSError as err:
+        print("WARNING: could not remove %s: %s" % (pathname, err),
+              file=sys.stderr)
 
 
 def display(message, quiet=False):
     '''Print message to stdout unless quiet is True'''
     if not quiet:
         toolname = os.path.basename(sys.argv[0])
-        print "%s: %s" % (toolname, message)
+        print(("%s: %s" % (toolname, message)))
 
 
 def validate_build_info_keys(build_info, file_path):
@@ -102,34 +141,38 @@ def validate_build_info_keys(build_info, file_path):
     for key in valid_values:
         if key in build_info:
             if build_info[key] not in valid_values[key]:
-                print >> sys.stderr, (
-                    "ERROR: %s key '%s' has illegal value: %s"
-                    % (file_path, key, repr(build_info[key])))
-                print >> sys.stderr, (
-                    'ERROR: Legal values are: %s' % valid_values[key])
-                return None
+                print("ERROR: %s key '%s' has illegal value: %s"
+                      % (file_path, key, repr(build_info[key])),
+                      file=sys.stderr)
+                print('ERROR: Legal values are: %s' % valid_values[key],
+                      file=sys.stderr)
+                return False
+    return True
 
 
 def read_build_info(path):
     '''Reads and validates data in the build_info'''
     build_info = None
+    exception_list = (ExpatError, ValueError)
+    if YAML_INSTALLED:
+        exception_list = (ExpatError, ValueError, yaml.scanner.ScannerError)
     try:
         if path.endswith('.json'):
             with open(path, 'r') as openfile:
                 build_info = json.load(openfile)
         elif path.endswith(('.yaml', '.yml')):
             with open(path, 'r') as openfile:
-                build_info = yaml.load(openfile)
+                build_info = yaml.load(openfile, Loader=yaml.FullLoader)
         elif path.endswith('.plist'):
-            build_info = plistlib.readPlist(path)
-    except (ExpatError, ValueError, yaml.scanner.ScannerError) as err:
-        raise BuildError(
-            "%s is not a valid %s file: %s" % (path, path.split('.')[-1], str(err)))
+            build_info = readPlist(path)
+    except exception_list as err:
+        raise BuildError("%s is not a valid %s file: %s"
+                         % (path, path.split('.')[-1], str(err)))
     validate_build_info_keys(build_info, path)
     if '${version}' in build_info['name']:
         build_info['name'] = build_info['name'].replace(
             '${version}',
-            build_info['version']
+            str(build_info['version'])
         )
 
     return build_info
@@ -145,17 +188,15 @@ def make_component_property_list(build_info, options):
     cmd.extend(["--analyze", "--root", build_info['payload'], component_plist])
     try:
         returncode = subprocess.call(cmd)
-    except OSError, err:
+    except OSError as err:
         raise BuildError(
             "pkgbuild execution failed with error code %d: %s"
             % (err.errno, err.strerror))
     if returncode:
-        raise BuildError(
-            "pkgbuild failed with exit code %d: %s"
-            % (returncode, " ".join(str(err).split())))
+        raise BuildError("pkgbuild failed with exit code %d" % returncode)
     try:
-        plist = plistlib.readPlist(component_plist)
-    except ExpatError, err:
+        plist = readPlist(component_plist)
+    except ExpatError as err:
         raise BuildError("Couldn't read %s" % component_plist)
     # plist is an array of dicts, iterate through
     for bundle in plist:
@@ -164,8 +205,8 @@ def make_component_property_list(build_info, options):
             display('Turning off bundle relocation for %s'
                     % bundle['RootRelativeBundlePath'], options.quiet)
     try:
-        plistlib.writePlist(plist, component_plist)
-    except BaseException, err:
+        writePlist(plist, component_plist)
+    except BaseException as err:
         raise BuildError("Couldn't write %s" % component_plist)
     return component_plist
 
@@ -187,7 +228,7 @@ def make_pkginfo(build_info, options):
         fileobj.write(pkginfo_text)
         fileobj.close()
         return pkginfo_path
-    except (OSError, IOError), err:
+    except (OSError, IOError) as err:
         raise BuildError('Couldn\'t create PackageInfo file: %s' % err)
 
 
@@ -199,11 +240,11 @@ def default_build_info(project_dir):
     info['postinstall_action'] = 'none'
     info['preserve_xattr'] = False
     basename = os.path.basename(project_dir.rstrip('/')).replace(" ", "")
-    info['name'] = basename + '-${version}.pkg'
-    info['identifier'] = "com.github.munki.pkg." + basename
+    info['name'] = basename + '.pkg'
+    info['identifier'] = "ca.ecuad.macadmin." + basename
     info['install_location'] = '/'
-    info['version'] = "1.0"
-    info['distribution_style'] = False
+    info['version'] = "11.1"
+    info['distribution_style'] = True
     return info
 
 
@@ -212,10 +253,19 @@ def get_build_info(project_dir, options):
     info = default_build_info(project_dir)
     info['project_dir'] = project_dir
     # override default values with values from BUILD_INFO_PLIST
-    supported_keys = ['name', 'identifier', 'version', 'ownership',
-                      'install_location', 'postinstall_action',
-                      'preserve_xattr', 'suppress_bundle_relocation',
-                      'distribution_style', 'signing_info']
+    supported_keys = [
+        'name',
+        'identifier',
+        'version',
+        'ownership',
+        'install_location',
+        'postinstall_action',
+        'preserve_xattr',
+        'suppress_bundle_relocation',
+        'distribution_style',
+        'signing_info',
+        'notarization_info',
+    ]
     build_file = os.path.join(project_dir, BUILD_INFO_FILE)
     file_type = None
     if not options.yaml and not options.json:
@@ -266,8 +316,8 @@ def non_recommended_permissions_in_bom(project_dir):
                 if user_group != '0/0':
                     return True
         return False
-    except (OSError, ValueError), err:
-        print >> sys.stderr, 'ERROR: %s' % err
+    except (OSError, ValueError) as err:
+        print('ERROR: %s' % err, file=sys.stderr)
         return False
 
 
@@ -290,15 +340,15 @@ def sync_from_bom_info(project_dir, options):
         build_info = default_build_info(project_dir)
     running_as_root = (os.geteuid() == 0)
     if not os.path.exists(bom_list_file):
-        print >> sys.stderr, (
+        print((
             "ERROR: Can't sync with bom info: no %s found in project directory."
-            % BOM_TEXT_FILE)
+            % BOM_TEXT_FILE), file=sys.stderr)
         return -1
     if build_info['ownership'] != 'recommended' and not running_as_root:
-        print >> sys.stderr, (
+        print((
             "\nWARNING: build-info ownership: %s might require using "
             "sudo to properly sync owner and group for payload files.\n"
-            % build_info['ownership'])
+            % build_info['ownership']), file=sys.stderr)
 
     returncode = 0
     changes_made = 0
@@ -326,11 +376,11 @@ def sync_from_bom_info(project_dir, options):
                 if basename.startswith('._'):
                     otherfile = os.path.join(
                         os.path.dirname(path), basename[2:])
-                    print >> sys.stderr, (
+                    print((
                         'WARNING: file %s contains extended attributes or a '
                         'resource fork for %s. git and pkgbuild may not '
                         'properly preserve extended attributes.'
-                        % (path, otherfile))
+                        % (path, otherfile)), file=sys.stderr)
                     continue
                 if os.path.lexists(payload_path):
                     # file exists, check permission bits and adjust if needed
@@ -351,8 +401,8 @@ def sync_from_bom_info(project_dir, options):
                     continue
                 else:
                     # missing file. This is a problem.
-                    print >> sys.stderr, (
-                        "ERROR: File %s is missing in payload" % payload_path)
+                    print("ERROR: File %s is missing in payload"
+                          % payload_path, file=sys.stderr)
                     returncode = -1
                     break
                 if running_as_root:
@@ -367,8 +417,8 @@ def sync_from_bom_info(project_dir, options):
                         os.lchown(payload_path, desired_user, desired_group)
                         changes_made += 1
 
-    except (OSError, ValueError), err:
-        print >> sys.stderr, 'ERROR: %s' % err
+    except (OSError, ValueError) as err:
+        print('ERROR: %s' % err, file=sys.stderr)
         return -1
 
     if returncode == 0 and not options.quiet:
@@ -420,7 +470,7 @@ def write_build_info(build_info, project_dir, options):
                 json.dump(
                     build_info, json_file, ensure_ascii=True,
                     indent=4, separators=(',', ': '))
-        if options.yaml:
+        elif options.yaml:
             build_info_yaml = os.path.join(
                 project_dir, "%s.yaml" % BUILD_INFO_FILE)
             with open(build_info_yaml, 'w') as yaml_file:
@@ -430,8 +480,8 @@ def write_build_info(build_info, project_dir, options):
         else:
             build_info_plist = os.path.join(
                 project_dir, "%s.plist" % BUILD_INFO_FILE)
-            plistlib.writePlist(build_info, build_info_plist)
-    except OSError, err:
+            writePlist(build_info, build_info_plist)
+    except OSError as err:
         raise MunkiPkgError(err)
 
 
@@ -447,10 +497,10 @@ def create_template_project(project_dir, options):
     '''Create an empty pkg project directory with default settings'''
     if os.path.exists(project_dir):
         if not options.force:
-            print >> sys.stderr, (
+            print((
                 "ERROR: %s already exists! "
                 "Use --force to convert it to a project directory."
-                % project_dir)
+                % project_dir), file=sys.stderr)
             return -1
     payload_dir = os.path.join(project_dir, 'payload')
     scripts_dir = os.path.join(project_dir, 'scripts')
@@ -466,9 +516,10 @@ def create_template_project(project_dir, options):
         create_default_gitignore(project_dir)
         display(
             "Created new package project at %s" % project_dir, options.quiet)
-    except (OSError, MunkiPkgError), err:
-        print >> sys.stderr, 'ERROR: %s' % err
+    except (OSError, MunkiPkgError) as err:
+        print('ERROR: %s' % err, file=sys.stderr)
         return -1
+    return 0
 
 
 def export_bom(bomfile, project_dir):
@@ -481,7 +532,7 @@ def export_bom(bomfile, project_dir):
             _, stderr = proc.communicate()
             if proc.returncode:
                 raise MunkiPkgError(stderr)
-    except OSError, err:
+    except OSError as err:
         raise MunkiPkgError(err)
 
 
@@ -517,7 +568,11 @@ def add_signing_options_to_cmd(cmd, build_info, options):
         if 'additional_cert_names' in signing_info:
             additional_cert_names = signing_info['additional_cert_names']
             # convert single string to list
-            if isinstance(additional_cert_names, basestring):
+            try:
+                text_types = basestring # pylint: disable=basestring-builtin
+            except NameError:
+                text_types = str
+            if isinstance(additional_cert_names, text_types):
                 additional_cert_names = [additional_cert_names]
             for cert_name in additional_cert_names:
                 cmd.extend(['--cert', cert_name])
@@ -533,7 +588,7 @@ def build_pkg(build_info, options):
     cmd = [PKGBUILD,
            '--ownership', build_info['ownership'],
            '--identifier', build_info['identifier'],
-           '--version', build_info['version'],
+           '--version', str(build_info['version']),
            '--info', build_info['pkginfo_path']]
     if build_info['payload']:
         cmd.extend(['--root', build_info['payload']])
@@ -578,7 +633,7 @@ def build_distribution_pkg(build_info, options):
     # if build_info contains a product id use that for product id, otherwise
     # use package identifier
     product_id = build_info.get('product id', build_info['identifier'])
-    cmd.extend(['--identifier', product_id, '--version', build_info['version']])
+    cmd.extend(['--identifier', product_id, '--version', str(build_info['version'])])
     # add the input and output package paths
     cmd.extend(['--package', pkginputname, distoutputname])
 
@@ -591,8 +646,181 @@ def build_distribution_pkg(build_info, options):
         display("Renaming distribution package %s to %s"
                 % (distoutputname, pkginputname), options.quiet)
         os.rename(distoutputname, pkginputname)
-    except OSError, err:
+    except OSError as err:
         raise BuildError(err)
+
+
+def get_primary_bundle_id(build_info):
+    '''Gets primary bundle id for notarization'''
+    primary_bundle_id = build_info['notarization_info'].get(
+            'primary_bundle_id',
+            build_info['identifier'],
+    )
+
+    # Apple notary service does not like underscores
+    primary_bundle_id = primary_bundle_id.replace('_', '-')
+
+    return primary_bundle_id
+
+
+def upload_to_notary(build_info, options):
+    '''Use xcrun altool to upload the package to Apple notary service'''
+    if not (
+        'username' in build_info['notarization_info']
+        and 'password' in build_info['notarization_info']
+    ):
+        raise MunkiPkgError("notarization_info lacks username or password.")
+
+    display("Uploading package to Apple notary service", options.quiet)
+    cmd = [
+        XCRUN,
+        'altool',
+        '--notarize-app',
+        '--primary-bundle-id',
+        get_primary_bundle_id(build_info),
+        '--username',
+        build_info['notarization_info']['username'],
+        '--password',
+        build_info['notarization_info']['password'],
+        '--output-format',
+        'xml',
+        '--file',
+        os.path.join(build_info['build_dir'], build_info['name']),
+    ]
+    if 'asc_provider' in build_info['notarization_info']:
+        cmd.extend(
+            ['--asc-provider', build_info['notarization_info']['asc_provider']]
+        )
+    retcode, proc_stdout, proc_stderr = run_subprocess(cmd)
+
+    try:
+        output = readPlistFromString(proc_stdout)
+    except ExpatError:
+        print(proc_stderr, file=sys.stderr)
+        raise MunkiPkgError("Notarization upload failed. Unable to run xcrun altool")
+
+    if retcode:
+        for product_error in output.get('product-errors', []):
+            print(
+                "altool: FAILURE " + product_error.get('message', 'UNKNOWN ERROR'),
+                file=sys.stderr
+            )
+        raise MunkiPkgError("Notarization failed")
+
+    try:
+        request_uuid = output['notarization-upload']['RequestUUID']
+        display("RequestUUID " + request_uuid, options.quiet, "altool")
+        display("SUCCESS " + output['success-message'], options.quiet, "altool")
+    except KeyError:
+        raise MunkiPkgError("Unexpected output from altool")
+
+    return request_uuid
+
+
+def get_notarization_state(request_uuid, build_info, options):
+    '''Checks for result of notarization process'''
+    state = {}
+    cmd = [
+        XCRUN,
+        'altool',
+        '--notarization-info',
+        request_uuid,
+        '--username',
+        build_info['notarization_info']['username'],
+        '--password',
+        build_info['notarization_info']['password'],
+        '--output-format',
+        'xml',
+    ]
+    retcode, proc_stdout, proc_stderr = run_subprocess(cmd)
+
+    try:
+        output = readPlistFromString(proc_stdout)
+    except ExpatError:
+        print(proc_stderr, file=sys.stderr)
+        raise MunkiPkgError("Notarization check failed. Unable to run xcrun altool")
+    if retcode or 'notarization-info' not in output:
+        print("altool: " + output.get('success-message', 'Unexpected response'))
+        print("altool: DEBUG output follows")
+        print(output)
+        state['status'] = 'Unknown'
+    else:
+        state['log_url'] = output['notarization-info'].get('LogFileURL', '')
+        state['status'] = output['notarization-info'].get('Status', 'Unknown')
+        state['code'] = output['notarization-info'].get('Status Code', None)
+        state['message'] = output['notarization-info'].get('Status Message', '')
+    return state
+
+
+def notarization_done(state, sleep_time, options):
+    '''Evaluates whether notarization is still in progress'''
+    if state['status'] == 'success':
+        display("Notarization successful. {}".format(state['message']), options.quiet)
+        return True
+    elif state['status'] in ['in progress', 'Unknown']:
+        display(
+            "Notarization state: {}. Trying again in {} seconds".format(
+                state['status'],
+                sleep_time,
+            ),
+            options.quiet,
+        )
+        return False
+    else:
+        display(
+            "Notarization unsuccessful:\n"
+            "\tStatus: {}\n"
+            "\tStatus Code: {}\n"
+            "\tStatus Message: {}\n"
+            "\tLogFileURL: {}".format(
+                state['status'], state['code'], state['message'], state['log_url']
+            ),
+            options.quiet,
+        )
+        raise MunkiPkgError("Notarization failed")
+
+
+def wait_for_notarization(request_uuid, build_info, options):
+    '''Checks notarization state until it is done or we exceed the timeout value'''
+    display("Getting notarization state", options.quiet)
+    timeout = build_info['notarization_info'].get('staple_timeout', STAPLE_TIMEOUT)
+    counter = 0
+    sleep_time = STAPLE_SLEEP
+
+    while counter < timeout:
+        time.sleep(sleep_time)
+        counter += sleep_time
+        sleep_time += STAPLE_SLEEP
+
+        state = get_notarization_state(request_uuid, build_info, options)
+
+        if notarization_done(state, sleep_time, options):
+            return True
+
+    print(
+        "munkipkg: Timeout EXCEEDED when waiting for the notarization to complete. "
+        "You can manually staple the package later if notarization is successful.",
+        file=sys.stderr,
+    )
+    return False
+
+
+def staple(build_info, options):
+    '''Use xcrun staple to add a staple to our package'''
+    display("Stapling package", options.quiet)
+    cmd = [
+        XCRUN,
+        'stapler',
+        'staple',
+        os.path.join(build_info['build_dir'], build_info['name']),
+    ]
+    retcode, proc_stdout, proc_stderr = run_subprocess(cmd)
+
+    if retcode:
+        print("stapler: FAILURE " + proc_stderr, file=sys.stderr)
+        raise MunkiPkgError("Stapling failed")
+    else:
+        display("The staple and validate action worked!", options.quiet)
 
 
 def build(project_dir, options):
@@ -602,15 +830,15 @@ def build(project_dir, options):
     try:
         try:
             build_info = get_build_info(project_dir, options)
-        except MunkiPkgError, err:
-            print >> sys.stderr, str(err)
+        except MunkiPkgError as err:
+            print(str(err), file=sys.stderr)
             exit(-1)
 
         if build_info['ownership'] in ['preserve', 'preserve-other']:
             if os.geteuid() != 0:
-                print >> sys.stderr, (
-                    "\nWARNING: build-info ownership: %s might require using "
-                    "sudo to build this package.\n" % build_info['ownership'])
+                print("\nWARNING: build-info ownership: %s might require "
+                      "using sudo to build this package.\n"
+                      % build_info['ownership'], file=sys.stderr)
 
         add_project_subdirs(build_info)
 
@@ -657,12 +885,24 @@ def build(project_dir, options):
         if build_info['distribution_style']:
             build_distribution_pkg(build_info, options)
 
+        # notarize the pkg
+        if 'notarization_info' in build_info and not options.skip_notarization:
+            try:
+                request_uuid = upload_to_notary(build_info, options)
+                if not options.skip_stapling and wait_for_notarization(
+                    request_uuid, build_info, options
+                ):
+                    staple(build_info, options)
+            except MunkiPkgError as err:
+                print("ERROR: %s" % err, file=sys.stderr)
+                return -1
+
         # cleanup temp dir
         _ = subprocess.call(["/bin/rm", "-rf", build_info['tmpdir']])
         return 0
 
-    except BuildError, err:
-        print >> sys.stderr, 'ERROR: %s' % err
+    except BuildError as err:
+        print('ERROR: %s' % err, file=sys.stderr)
         if build_info.get('tmpdir'):
             # cleanup temp dir
             _ = subprocess.call(["/bin/rm", "-rf", build_info['tmpdir']])
@@ -674,7 +914,7 @@ def get_pkginfo_attr(pkginfo_dom, attribute_name):
     pkgrefs = pkginfo_dom.getElementsByTagName('pkg-info')
     if pkgrefs:
         for ref in pkgrefs:
-            keys = ref.attributes.keys()
+            keys = list(ref.attributes.keys())
             if attribute_name in keys:
                 return ref.attributes[attribute_name].value.encode('UTF-8')
     return None
@@ -689,7 +929,7 @@ def expand_payload(project_dir):
         try:
             os.rename(payload_file, payload_archive)
             os.mkdir(payload_dir)
-        except OSError, err:
+        except OSError as err:
             raise PkgImportError(err)
         cmd = [DITTO, '-x', payload_archive, payload_dir]
         retcode = subprocess.call(cmd)
@@ -727,7 +967,7 @@ def convert_packageinfo(pkg_path, project_dir, options):
 def convert_info_plist(pkg_path, project_dir, options):
     '''Read bundle pkg Info.plist and create build-info file'''
     info_plist = os.path.join(pkg_path, 'Contents/Info.plist')
-    info = plistlib.readPlist(info_plist)
+    info = readPlist(info_plist)
     build_info = {}
 
     build_info['identifier'] = info.get('CFBundleIdentifier', '')
@@ -767,7 +1007,7 @@ def handle_distribution_pkg(project_dir):
                 dest_path = os.path.join(project_dir, item)
                 try:
                     os.rename(source_path, dest_path)
-                except OSError, err:
+                except OSError as err:
                     raise PkgImportError(err)
         try:
             os.rmdir(pkg)
@@ -826,9 +1066,9 @@ def copy_bundle_pkg_scripts(pkg_path, project_dir, options):
                         % (found_scripts[0], supported_name), options.quiet)
                 os.rename(current_script_path, new_script_path)
             elif len(found_scripts) > 1:
-                print >> sys.stderr, (
-                    "WARNING: Multiple %sXXXXXX scripts found. "
-                    "Flat packages support only '%sinstall'." % (kind, kind))
+                print("WARNING: Multiple %sXXXXXX scripts found. "
+                      "Flat packages support only '%sinstall'." % (kind, kind),
+                      file=sys.stderr)
 
 
 def import_bundle_pkg(pkg_path, project_dir, options):
@@ -852,7 +1092,7 @@ def import_bundle_pkg(pkg_path, project_dir, options):
         payload_dir = os.path.join(project_dir, 'payload')
         try:
             os.mkdir(payload_dir)
-        except OSError, err:
+        except OSError as err:
             raise PkgImportError(err)
         cmd = [DITTO, '-x', archive, payload_dir]
         retcode = subprocess.call(cmd)
@@ -863,19 +1103,20 @@ def import_bundle_pkg(pkg_path, project_dir, options):
         convert_info_plist(pkg_path, project_dir, options)
         if (non_recommended_permissions_in_bom(project_dir) and
                 os.geteuid() != 0):
-            print >> sys.stderr, (
+            print(
                 '\nWARNING: package contains non-default owner/group on some '
                 'files. build-info ownership has been set to "preserve". '
                 '\nCheck the bom for accuracy.'
                 '\nRun munkipkg --sync with sudo to apply the correct owner '
-                'and group to payload files.\n')
+                'and group to payload files.\n', file=sys.stderr
+            )
         sync_from_bom_info(project_dir, options)
         create_default_gitignore(project_dir)
         display("Created new package project at %s"
                 % project_dir, options.quiet)
         return 0
-    except(MunkiPkgError, OSError), err:
-        print >> sys.stderr, 'ERROR: %s' % err
+    except (MunkiPkgError, OSError) as err:
+        print('ERROR: %s' % err, file=sys.stderr)
         return -1
 
 
@@ -905,19 +1146,20 @@ def import_flat_pkg(pkg_path, project_dir, options):
         convert_packageinfo(pkg_path, project_dir, options)
         if (non_recommended_permissions_in_bom(project_dir) and
                 os.geteuid() != 0):
-            print >> sys.stderr, (
+            print(
                 '\nWARNING: package contains non-default owner/group on some '
                 'files. build-info ownership has been set to "preserve". '
                 '\nCheck the bom for accuracy.'
                 '\nRun munkipkg --sync with sudo to apply the correct owner '
-                'and group to payload files.\n')
+                'and group to payload files.\n', file=sys.stderr
+            )
         sync_from_bom_info(project_dir, options)
         create_default_gitignore(project_dir)
         display("Created new package project at %s"
                 % project_dir, options.quiet)
         return 0
-    except(MunkiPkgError, OSError), err:
-        print >> sys.stderr, 'ERROR: %s' % err
+    except (MunkiPkgError, OSError) as err:
+        print('ERROR: %s' % err, file=sys.stderr)
         return -1
 
 
@@ -925,23 +1167,22 @@ def import_pkg(pkg_path, project_dir, options):
     '''Imports an existing pkg into a project directory. Returns a
     boolean to indicate success or failure.'''
     if os.path.exists(project_dir):
-        print >> sys.stderr, (
-            "ERROR: Directory %s already exists." % project_dir)
+        print("ERROR: Directory %s already exists." % project_dir,
+              file=sys.stderr)
         return False
 
     if os.path.isdir(pkg_path):
         return import_bundle_pkg(pkg_path, project_dir, options)
-    else:
-        return import_flat_pkg(pkg_path, project_dir, options)
+    return import_flat_pkg(pkg_path, project_dir, options)
 
 
 def valid_project_dir(project_dir):
     '''validate project dir. Returns a boolean'''
     if not os.path.exists(project_dir):
-        print >> sys.stderr, ("ERROR: %s: Project not found." % project_dir)
+        print(("ERROR: %s: Project not found." % project_dir), file=sys.stderr)
         return False
     elif not os.path.isdir(project_dir):
-        print >> sys.stderr, ("ERROR: %s is not a directory." % project_dir)
+        print(("ERROR: %s is not a directory." % project_dir), file=sys.stderr)
         return False
     return True
 
@@ -980,27 +1221,34 @@ def main():
     parser.add_option('-f', '--force', action='store_true',
                       help='Forces creation of project directory if it already '
                            'exists. ')
+    parser.add_option('--skip-notarization', action='store_true',
+                      help='Skips whole notarization process when '
+                           'notarization is specified in build-info')
+    parser.add_option('--skip-stapling', action='store_true',
+                      help='Skips only stapling part of notarization process '
+                           'when notarization is specified in build-info')
     options, arguments = parser.parse_args()
 
-    if len(arguments) == 0:
+    if not arguments:
         parser.print_usage()
         sys.exit(0)
 
     if len(arguments) > 1:
-        print >> sys.stderr, (
-            "ERROR: Only a single package project can be built at a time!")
+        print("ERROR: Only a single package project can be built at a time!",
+              file=sys.stderr)
         sys.exit(-1)
 
     if options.json and options.yaml:
-        print >> sys.stderr, (
-            "ERROR: Only a single build-info file can be built at a time!")
+        print("ERROR: Only a single build-info file can be built at a time!",
+              file=sys.stderr)
         sys.exit(-1)
 
-    if options.yaml and not yaml_installed:
-        print >> sys.stderr, (
-            "ERROR: PyYAML missing. Please run 'sudo easy_install pip' " \
-            "followed by 'sudo pip install -r requirements.txt'"
-            )
+    if options.yaml and not YAML_INSTALLED:
+        print(
+            "ERROR: PyYAML missing. Please run 'sudo easy_install pip' "
+            "followed by 'sudo pip install -r requirements.txt'",
+            file=sys.stderr
+        )
         sys.exit(-1)
 
     if options.create:
